@@ -32,6 +32,7 @@ except ImportError:
 from ._plotting import plot  # noqa: I001
 from ._stats import compute_stats
 from ._util import _as_str, _Indicator, _Data, try_
+from .symbol_config import BTCUSDT, SymbolConfig
 
 __pdoc__ = {
     'Strategy.__init__': False,
@@ -195,7 +196,7 @@ class Strategy(metaclass=ABCMeta):
     _FULL_EQUITY = __FULL_EQUITY(1 - sys.float_info.epsilon)
 
     def buy(self, *,
-            size: float = _FULL_EQUITY,
+            size: float = None,
             limit: Optional[float] = None,
             stop: Optional[float] = None,
             sl: Optional[float] = None,
@@ -208,8 +209,6 @@ class Strategy(metaclass=ABCMeta):
 
         See also `Strategy.sell()`.
         """
-        assert 0 < size < 1 or round(size) == size, \
-            "size must be a positive fraction of equity, or a positive whole number of units"
         return self._broker.new_order(size, limit, stop, sl, tp, tag)
 
     def sell(self, *,
@@ -698,7 +697,7 @@ class Trade:
 
 
 class _Broker:
-    def __init__(self, *, data, cash, commission, margin,
+    def __init__(self, *, data, cash, commission, margin, symbol_config,
                  trade_on_close, hedging, exclusive_orders, index):
         assert 0 < cash, f"cash should be >0, is {cash}"
         assert -.1 <= commission < .1, \
@@ -714,6 +713,7 @@ class _Broker:
         self._exclusive_orders = exclusive_orders
 
         self._equity = np.tile(np.nan, len(index))
+        self._symbol_config: SymbolConfig = symbol_config
         self.orders: List[Order] = []
         self.trades: List[Trade] = []
         self.position = Position(self)
@@ -734,14 +734,17 @@ class _Broker:
         """
         Argument size indicates whether the order is long or short
         """
-        size = float(size)
+        if size is None:
+            size = self.equity / (limit if limit else self.last_price)
+        size = self._adjusted_size(float(size), limit)
         stop = stop and float(stop)
         limit = limit and float(limit)
         sl = sl and float(sl)
         tp = tp and float(tp)
 
         is_long = size > 0
-        adjusted_price = self._adjusted_price(size)
+        # adjusted_price = self._adjusted_price(size)
+        adjusted_price = limit if limit else self.last_price
 
         if is_long:
             if not (sl or -np.inf) < (limit or stop or adjusted_price) < (tp or np.inf):
@@ -784,6 +787,16 @@ class _Broker:
         In long positions, the adjusted price is a fraction higher, and vice versa.
         """
         return (price or self.last_price) * (1 + copysign(self._commission, size))
+
+    def _adjusted_size(self, size=None, price=None) -> float:
+        """
+        Order.size, adjusted for commisions.
+        The size must be a multiple of the ticksize (default: 0.00001)
+        """
+        # size * price * commission + size * price = equity
+        # (1 + commision) * size * price = equity
+        current_price = price if price else self.last_price
+        return self._symbol_config.convert_order_size((self.equity / current_price) / (1 + self._commission))
 
     @property
     def equity(self) -> float:
@@ -881,7 +894,7 @@ class _Broker:
                     assert order not in self.orders  # Removed when trade was closed
                 else:
                     # It's a trade.close() order, now done
-                    assert abs(_prev_size) >= abs(size) >= 1
+                    assert abs(_prev_size) >= abs(size)
                     self.orders.remove(order)
                 continue
 
@@ -894,15 +907,7 @@ class _Broker:
             # If order size was specified proportionally,
             # precompute true size in units, accounting for margin and spread/commissions
             size = order.size
-            if -1 < size < 1:
-                size = copysign(int((self.margin_available * self._leverage * abs(size))
-                                    // adjusted_price), size)
-                # Not enough cash/margin even for a single unit
-                if not size:
-                    self.orders.remove(order)
-                    continue
-            assert size == round(size)
-            need_size = int(size)
+            need_size = size
 
             if not self._hedging:
                 # Fill position by FIFO closing/reducing existing opposite-facing trades.
@@ -1028,6 +1033,7 @@ class Backtest:
                  cash: float = 10_000,
                  commission: float = .0,
                  margin: float = 1.,
+                 symbol_config: SymbolConfig = BTCUSDT,
                  trade_on_close=False,
                  hedging=False,
                  exclusive_orders=False
@@ -1095,7 +1101,11 @@ class Backtest:
             (data.index.is_numeric() and
              (data.index > pd.Timestamp('1975').timestamp()).mean() > .8)):
             try:
-                data.index = pd.to_datetime(data.index, infer_datetime_format=True)
+                if data.index[0] >= 10**12:
+                    # The timestamp of crypto exchange ohlcv data is stored in millisecond.
+                    data.index = pd.to_datetime(data.index, unit='ms')
+                else:
+                    data.index = pd.to_datetime(data.index, infer_datetime_format=True)
             except ValueError:
                 pass
 
@@ -1126,8 +1136,9 @@ class Backtest:
                           stacklevel=2)
 
         self._data: pd.DataFrame = data
+        self._symbol_config = symbol_config
         self._broker = partial(
-            _Broker, cash=cash, commission=commission, margin=margin,
+            _Broker, cash=cash, commission=commission, margin=margin, symbol_config=symbol_config,
             trade_on_close=trade_on_close, hedging=hedging,
             exclusive_orders=exclusive_orders, index=data.index,
         )
