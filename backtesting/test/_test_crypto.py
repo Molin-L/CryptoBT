@@ -1,20 +1,11 @@
 from unittest import TestCase
-from unittest.mock import patch
+
 from backtesting import Backtest, Strategy
 from backtesting.lib import (
-    OHLCV_AGG,
-    SignalStrategy,
-    TrailingStrategy,
-    barssince,
-    compute_stats,
-    cross,
     crossover,
-    plot_heatmaps,
-    quantile,
-    random_ohlc_data,
-    resample_apply,
 )
 from backtesting.test import SMA, BTCUSDT
+
 
 class SmaCross(Strategy):
     # NOTE: These values are also used on the website!
@@ -32,6 +23,7 @@ class SmaCross(Strategy):
         elif crossover(self.sma2, self.sma1):
             self.position.close()
             self.sell()
+
 
 class TestCryptoBackTest(TestCase):
 

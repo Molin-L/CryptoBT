@@ -24,6 +24,7 @@ from numpy.random import default_rng
 
 try:
     from tqdm.auto import tqdm as _tqdm
+
     _tqdm = partial(_tqdm, leave=False)
 except ImportError:
     def _tqdm(seq, **_):
@@ -33,6 +34,7 @@ from ._plotting import plot  # noqa: I001
 from ._stats import compute_stats
 from ._util import _as_str, _Indicator, _Data, try_
 from .symbol_config import BTCUSDT, SymbolConfig
+from .idl import Side, TradeStatus
 
 __pdoc__ = {
     'Strategy.__init__': False,
@@ -50,6 +52,7 @@ class Strategy(metaclass=ABCMeta):
     `backtesting.backtesting.Strategy.next` to define
     your own strategy.
     """
+
     def __init__(self, broker, data, params):
         self._indicators = []
         self._broker: _Broker = broker
@@ -144,7 +147,7 @@ class Strategy(metaclass=ABCMeta):
             raise ValueError(
                 'Indicators must return (optionally a tuple of) numpy.arrays of same '
                 f'length as `data` (data shape: {self._data.Close.shape}; indicator "{name}" '
-                f'shape: {getattr(value, "shape" , "")}, returned value: {value})')
+                f'shape: {getattr(value, "shape", "")}, returned value: {value})')
 
         if plot and overlay is None and np.issubdtype(value.dtype, np.number):
             x = value / self._data.Close
@@ -193,6 +196,7 @@ class Strategy(metaclass=ABCMeta):
 
     class __FULL_EQUITY(float):  # noqa: N801
         def __repr__(self): return '.9999'
+
     _FULL_EQUITY = __FULL_EQUITY(1 - sys.float_info.epsilon)
 
     def buy(self, *,
@@ -201,6 +205,7 @@ class Strategy(metaclass=ABCMeta):
             stop: Optional[float] = None,
             sl: Optional[float] = None,
             tp: Optional[float] = None,
+            reduce_only: Optional[bool] = None,
             tag: object = None):
         """
         Place a new long order. For explanation of parameters, see `Order` and its properties.
@@ -209,14 +214,15 @@ class Strategy(metaclass=ABCMeta):
 
         See also `Strategy.sell()`.
         """
-        return self._broker.new_order(size, limit, stop, sl, tp, tag)
+        return self._broker.new_order(size, Side.Buy, limit, stop, sl, tp, tag, reduce_only=reduce_only)
 
     def sell(self, *,
-             size: float = _FULL_EQUITY,
+             size: float = None,
              limit: Optional[float] = None,
              stop: Optional[float] = None,
              sl: Optional[float] = None,
              tp: Optional[float] = None,
+             reduce_only: Optional[bool] = False,
              tag: object = None):
         """
         Place a new short order. For explanation of parameters, see `Order` and its properties.
@@ -227,9 +233,8 @@ class Strategy(metaclass=ABCMeta):
             If you merely want to close an existing long position,
             use `Position.close()` or `Trade.close()`.
         """
-        assert 0 < size < 1 or round(size) == size, \
-            "size must be a positive fraction of equity, or a positive whole number of units"
-        return self._broker.new_order(-size, limit, stop, sl, tp, tag)
+
+        return self._broker.new_order(size, Side.Sell, limit, stop, sl, tp, tag, reduce_only=reduce_only)
 
     @property
     def equity(self) -> float:
@@ -290,6 +295,7 @@ class _Orders(tuple):
     """
     TODO: remove this class. Only for deprecation.
     """
+
     def cancel(self):
         """Cancel all non-contingent (i.e. SL/TP) orders."""
         for order in self:
@@ -381,23 +387,28 @@ class Order:
     [filled]: https://www.investopedia.com/terms/f/fill.asp
     [Good 'Til Canceled]: https://www.investopedia.com/terms/g/gtc.asp
     """
+
     def __init__(self, broker: '_Broker',
                  size: float,
+                 side: Side,
                  limit_price: Optional[float] = None,
                  stop_price: Optional[float] = None,
                  sl_price: Optional[float] = None,
                  tp_price: Optional[float] = None,
                  parent_trade: Optional['Trade'] = None,
+                 reduce_only: Optional[bool] = False,
                  tag: object = None):
         self.__broker = broker
         assert size != 0
         self.__size = size
+        self.__side = side
         self.__limit_price = limit_price
         self.__stop_price = stop_price
         self.__sl_price = sl_price
         self.__tp_price = tp_price
         self.__parent_trade = parent_trade
         self.__tag = tag
+        self.__reduce_only = reduce_only
 
     def _replace(self, **kwargs):
         for k, v in kwargs.items():
@@ -454,6 +465,11 @@ class Order:
         return self.__limit_price
 
     @property
+    def limit_price(self) -> Optional[float]:
+        """Alias for `limit`."""
+        return self.__limit_price
+
+    @property
     def stop(self) -> Optional[float]:
         """
         Order stop price for [stop-limit/stop-market][_] order,
@@ -484,6 +500,14 @@ class Order:
     @property
     def parent_trade(self):
         return self.__parent_trade
+
+    @property
+    def side(self):
+        return self.__side
+
+    @property
+    def reduce_only(self):
+        return self.__reduce_only
 
     @property
     def tag(self):
@@ -527,13 +551,16 @@ class Trade:
     When an `Order` is filled, it results in an active `Trade`.
     Find active trades in `Strategy.trades` and closed, settled trades in `Strategy.closed_trades`.
     """
-    def __init__(self, broker: '_Broker', size: int, entry_price: float, entry_bar, tag):
+
+    def __init__(self, broker: '_Broker', size: float, side: Side, entry_price: float, entry_bar, tag):
         self.__broker = broker
         self.__size = size
+        self.__side = side
         self.__entry_price = entry_price
         self.__exit_price: Optional[float] = None
         self.__entry_bar: int = entry_bar
         self.__exit_bar: Optional[int] = None
+        self.__exit_size: Optional[float] = None
         self.__sl_order: Optional[Order] = None
         self.__tp_order: Optional[Order] = None
         self.__tag = tag
@@ -541,7 +568,7 @@ class Trade:
     def __repr__(self):
         return f'<Trade size={self.__size} time={self.__entry_bar}-{self.__exit_bar or ""} ' \
                f'price={self.__entry_price}-{self.__exit_price or ""} pl={self.pl:.0f}' \
-               f'{" tag="+str(self.__tag) if self.__tag is not None else ""}>'
+               f'{" tag=" + str(self.__tag) if self.__tag is not None else ""}>'
 
     def _replace(self, **kwargs):
         for k, v in kwargs.items():
@@ -554,11 +581,16 @@ class Trade:
     def close(self, portion: float = 1.):
         """Place new `Order` to close `portion` of the trade at next market price."""
         assert 0 < portion <= 1, "portion must be a fraction between 0 and 1"
-        size = copysign(max(1, round(abs(self.__size) * portion)), -self.__size)
-        order = Order(self.__broker, size, parent_trade=self, tag=self.__tag)
+        order = Order(self.__broker, self.size, self.side.opposite(), parent_trade=self, tag=self.__tag, reduce_only=True)
+        # Todo: immediately fill the order within the candle stick, so that the margin will be released immediately.
         self.__broker.orders.insert(0, order)
 
     # Fields getters
+
+    @property
+    def side(self):
+        """Trade side (long or short)."""
+        return self.__side
 
     @property
     def size(self):
@@ -692,7 +724,8 @@ class Trade:
             order.cancel()
         if price:
             kwargs = {'stop': price} if type == 'sl' else {'limit': price}
-            order = self.__broker.new_order(-self.size, trade=self, tag=self.tag, **kwargs)
+            order = self.__broker.new_order(self.size, side=self.side.opposite(), trade=self, tag=self.tag, **kwargs,
+                                            reduce_only=True)
             setattr(self, attr, order)
 
 
@@ -724,13 +757,16 @@ class _Broker:
 
     def new_order(self,
                   size: float,
+                  side: Side,
                   limit: Optional[float] = None,
                   stop: Optional[float] = None,
                   sl: Optional[float] = None,
                   tp: Optional[float] = None,
                   tag: object = None,
                   *,
-                  trade: Optional[Trade] = None):
+                  trade: Optional[Trade] = None,
+                  reduce_only: Optional[bool] = False
+                  ):
         """
         Argument size indicates whether the order is long or short
         """
@@ -742,11 +778,10 @@ class _Broker:
         sl = sl and float(sl)
         tp = tp and float(tp)
 
-        is_long = size > 0
         # adjusted_price = self._adjusted_price(size)
         adjusted_price = limit if limit else self.last_price
 
-        if is_long:
+        if side == Side.Buy:
             if not (sl or -np.inf) < (limit or stop or adjusted_price) < (tp or np.inf):
                 raise ValueError(
                     "Long orders require: "
@@ -757,7 +792,15 @@ class _Broker:
                     "Short orders require: "
                     f"TP ({tp}) < LIMIT ({limit or stop or adjusted_price}) < SL ({sl})")
 
-        order = Order(self, size, limit, stop, sl, tp, trade, tag)
+        order = Order(self, size, side, adjusted_price, stop, sl, tp, trade, reduce_only, tag)
+
+        # Add cost occupation when placing order.
+        '''
+        if self.available_balance < self.get_order_cost(order):
+            return None
+        self.available_balance -= self.get_order_cost(order)
+        '''
+
         # Put the new order in the order queue,
         # inserting SL/TP/trade-closing orders in-front
         if trade:
@@ -941,6 +984,7 @@ class _Broker:
             if need_size:
                 self._open_trade(adjusted_price,
                                  need_size,
+                                 order.side,
                                  order.sl,
                                  order.tp,
                                  time_index,
@@ -971,11 +1015,9 @@ class _Broker:
             self._process_orders()
 
     def _reduce_trade(self, trade: Trade, price: float, size: float, time_index: int):
-        assert trade.size * size < 0
         assert abs(trade.size) >= abs(size)
 
-        size_left = trade.size + size
-        assert size_left * trade.size >= 0
+        size_left = trade.size - size
         if not size_left:
             close_trade = trade
         else:
@@ -1004,8 +1046,7 @@ class _Broker:
 
     def _open_trade(self, price: float, size: int,
                     sl: Optional[float], tp: Optional[float], time_index: int, tag):
-        trade = Trade(self, size, price, time_index, tag)
-        self.trades.append(trade)
+        trade = Trade(self, size, side, price, time_index, tag)
         # Create SL/TP (bracket) orders.
         # Make sure SL order is created first so it gets adversarially processed before TP order
         # in case of an ambiguous tie (both hit within a single bar).
@@ -1026,6 +1067,7 @@ class Backtest:
     instance, or `backtesting.backtesting.Backtest.optimize` to
     optimize it.
     """
+
     def __init__(self,
                  data: pd.DataFrame,
                  strategy: Type[Strategy],
@@ -1096,12 +1138,12 @@ class Backtest:
 
         # Convert index to datetime index
         if (not isinstance(data.index, pd.DatetimeIndex) and
-            not isinstance(data.index, pd.RangeIndex) and
-            # Numeric index with most large numbers
-            (data.index.is_numeric() and
-             (data.index > pd.Timestamp('1975').timestamp()).mean() > .8)):
+                not isinstance(data.index, pd.RangeIndex) and
+                # Numeric index with most large numbers
+                (data.index.is_numeric() and
+                 (data.index > pd.Timestamp('1975').timestamp()).mean() > .8)):
             try:
-                if data.index[0] >= 10**12:
+                if data.index[0] >= 10 ** 12:
                     # The timestamp of crypto exchange ohlcv data is stored in millisecond.
                     data.index = pd.to_datetime(data.index, unit='ms')
                 else:
@@ -1122,9 +1164,7 @@ class Backtest:
                              'Please strip those lines with `df.dropna()` or '
                              'fill them in with `df.interpolate()` or whatever.')
         if np.any(data['Close'] > cash):
-            warnings.warn('Some prices are larger than initial cash value. Note that fractional '
-                          'trading is not supported. If you want to trade Bitcoin, '
-                          'increase initial cash, or trade μBTC or satoshis instead (GH-134).',
+            warnings.warn('Fractional trading is now supported.',
                           stacklevel=2)
         if not data.index.is_monotonic_increasing:
             warnings.warn('Data index is not sorted in ascending order. Sorting.',
@@ -1262,8 +1302,8 @@ class Backtest:
                  return_optimization: bool = False,
                  random_state: Optional[int] = None,
                  **kwargs) -> Union[pd.Series,
-                                    Tuple[pd.Series, pd.Series],
-                                    Tuple[pd.Series, pd.Series, dict]]:
+    Tuple[pd.Series, pd.Series],
+    Tuple[pd.Series, pd.Series, dict]]:
         """
         Optimize strategy parameters to an optimal combination.
         Returns result `pd.Series` of the best run.
@@ -1457,8 +1497,8 @@ class Backtest:
             return stats
 
         def _optimize_skopt() -> Union[pd.Series,
-                                       Tuple[pd.Series, pd.Series],
-                                       Tuple[pd.Series, pd.Series, dict]]:
+        Tuple[pd.Series, pd.Series],
+        Tuple[pd.Series, pd.Series, dict]]:
             try:
                 from skopt import forest_minimize
                 from skopt.callbacks import DeltaXStopper

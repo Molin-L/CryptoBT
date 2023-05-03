@@ -16,10 +16,9 @@ class Side(Enum):
         return Side.Buy
 
 
-class Position(Enum):
+class PositionSide(Enum):
     Long = 1
     Short = 2
-    Hedge = 3
 
 
 class OrderStatus(Enum):
