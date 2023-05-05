@@ -3,19 +3,16 @@ import re
 import sys
 import warnings
 from colorsys import hls_to_rgb, rgb_to_hls
-from itertools import cycle, combinations
 from functools import partial
+from itertools import cycle, combinations
 from typing import Callable, List, Union
 
-import numpy as np
 import pandas as pd
-
 from bokeh.colors import RGB
 from bokeh.colors.named import (
     lime as BULL_COLOR,
     tomato as BEAR_COLOR
 )
-from bokeh.plotting import figure as _figure
 from bokeh.models import (  # type: ignore
     CrosshairTool,
     CustomJS,
@@ -28,6 +25,8 @@ from bokeh.models import (  # type: ignore
     WheelZoomTool,
     LinearColorMapper,
 )
+from bokeh.plotting import figure as _figure
+
 try:
     from bokeh.models import CustomJSTickFormatter
 except ImportError:  # Bokeh < 3.0
@@ -728,4 +727,217 @@ def plot_heatmaps(heatmap: pd.Series, agg: Union[Callable, str], ncols: int,
     )
 
     show(fig, browser=None if open_browser else 'none')
+    return fig
+
+
+import plotly.graph_objects as go
+import plotly.io as pio
+import pandas as pd
+from plotly.subplots import make_subplots
+import numpy as np
+
+pio.templates.default = "plotly_dark"
+
+plotconfig = dict(
+    template="plotly_dark"
+)
+
+
+def plot_candlestick(fig, df: pd.DataFrame, stats):
+    fill_color_red = "rgba(255, 65, 55, 0.4)"
+    fill_color_green = "rgba(60, 150, 110, 0.4)"
+
+    line_color_red = "rgba(255, 65, 55, 1)"
+    line_color_green = "rgba(60, 150, 110, 1)"
+
+    # 1. Plot candlestick chart
+    if 'Date' not in df.columns:
+        df['Date'] = df.index
+    fig.add_trace(trace=go.Candlestick(x=df['Date'],
+                                       open=df['Open'],
+                                       high=df['High'],
+                                       low=df['Low'],
+                                       close=df['Close'],
+                                       showlegend=False,
+                                       increasing_line_color=fill_color_green,
+                                       decreasing_line_color=fill_color_red,
+                                       ),
+                  row=1, col=1)
+    long_trades = stats['_trades'][stats['_trades']['Size'] > 0]
+    short_trades = stats['_trades'][stats['_trades']['Size'] < 0]
+
+    # 2. Plot trades details
+    # Long trades
+    fig.add_trace(trace=go.Scatter(x=long_trades['EntryTime'],
+                                   y=long_trades['EntryPrice'],
+                                   mode='markers',
+                                   marker=dict(color="rgba(240, 85, 60, 0.5)", symbol='triangle-up', size=10,
+                                               line_width=2, line_color="rgba(240, 85, 60, 1)"), name='Long Entry'),
+                  row=1, col=1)
+
+    fig.add_trace(trace=go.Scatter(x=long_trades['ExitTime'],
+                                   y=long_trades['ExitPrice'],
+                                   mode='markers',
+                                   marker=dict(color="rgba(5, 200, 150, 0.5)", symbol='triangle-down', size=10,
+                                               line_width=2, line_color="rgba(5, 200, 150, 1)"), name='Long Exit'),
+                  row=1, col=1)
+    for rect in long_trades.itertuples():
+        if rect.ReturnPct > 0:
+            line_color = line_color_green
+            color = fill_color_green
+        else:
+            line_color = line_color_red
+            color = fill_color_red
+        fig.add_shape(type="rect",
+                      x0=rect.EntryTime,
+                      y0=rect.EntryPrice,
+                      x1=rect.ExitTime,
+                      y1=rect.ExitPrice,
+                      row=1, col=1,
+                      line=dict(color=line_color, width=2),
+                      fillcolor=color
+                      )
+        fig.add_vrect(x0=rect.EntryTime, x1=rect.ExitTime, row=1, col=1, fillcolor=color, opacity=0.5, line_width=0)
+    # Short trades
+    fig.add_trace(trace=go.Scatter(x=short_trades['EntryTime'],
+                                   y=short_trades['EntryPrice'],
+                                   mode='markers',
+                                   marker=dict(color="rgba(5, 200, 150, 0.5)", symbol='triangle-down', size=10,
+                                               line_width=2, line_color="rgba(5, 200, 150, 1)"), name='Short Entry'),
+                  row=1, col=1)
+
+    fig.add_trace(trace=go.Scatter(x=short_trades['ExitTime'],
+                                   y=short_trades['ExitPrice'],
+                                   mode='markers',
+                                   marker=dict(color="rgba(240, 85, 60, 0.5)", symbol='triangle-up', size=10,
+                                               line_width=2, line_color="rgba(240, 85, 60, 1)"), name='Short Exit'),
+                  row=1, col=1)
+
+    for rect in short_trades.itertuples():
+        if rect.ReturnPct > 0:
+            line_color = line_color_green
+            color = fill_color_green
+        else:
+            line_color = line_color_red
+            color = fill_color_red
+        fig.add_shape(type="rect",
+                      x0=rect.EntryTime,
+                      y0=rect.EntryPrice,
+                      x1=rect.ExitTime,
+                      y1=rect.ExitPrice,
+                      row=1, col=1,
+                      line=dict(color=line_color, width=2),
+                      fillcolor=color
+                      )
+        fig.add_vrect(x0=rect.EntryTime, x1=rect.ExitTime, row=1, col=1, fillcolor=color, opacity=0.5, line_width=0)
+    return fig
+
+
+def plot_pnl(fig, stats):
+    stats['_trades']['PnL_Norm'] = stats['_trades']['PnL'] / stats['_trades']['PnL'].max()
+    profit_trades = stats['_trades'][stats['_trades']['PnL'] > 0]
+    loss_trades = stats['_trades'][stats['_trades']['PnL'] < 0]
+
+    fig.add_trace(trace=go.Scatter(mode='markers',
+                                   x=profit_trades['ExitTime'],
+                                   y=profit_trades['ReturnPct'],
+                                   marker=dict(
+                                       color="green",
+                                       size=10,
+                                   ), name="Close-Profit"
+                                   ), row=2, col=1)
+    fig.add_trace(trace=go.Scatter(mode='markers',
+                                   x=loss_trades['ExitTime'],
+                                   y=loss_trades['ReturnPct'],
+                                   marker=dict(
+                                       color="red",
+                                       size=10,
+                                   ), name="Close-Loss"
+                                   ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="grey", line_width=2, row=2, col=1)
+    fig.update_layout(yaxis=dict(tickformat=".3%"), row=2, col=1)
+    return fig
+
+
+def plot_equity_curve(fig, df: pd.DataFrame, stats: pd.DataFrame):
+    if 'Date' not in stats['_equity_curve'].columns:
+        stats['_equity_curve']['Date'] = stats['_equity_curve'].index
+    equity = stats['_equity_curve']['Equity'] / stats['_equity_curve']['Equity'][0]
+
+    pos_mask = equity >= 1
+    origin = np.ones(len(stats['_equity_curve']['Date']))
+
+    if pos_mask.any():
+        pos_obj = equity.copy()
+        pos_obj[~pos_mask] = origin[~pos_mask]
+
+        fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                       y=np.ones(len(stats['_equity_curve']['Date'])),
+                                       mode='lines', line=dict(color="grey", width=1, dash='dash'), showlegend=False),
+                      row=3, col=1)
+
+        fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                       y=pos_obj,
+                                       mode='lines', line=dict(color="grey", width=1, dash='dash'), fill="tonexty",
+                                       fillcolor="rgba(0, 100, 0, 0.5)", name='Equity Curve', showlegend=False),
+                      row=3, col=1)
+    neg_mask = equity < 1
+    if neg_mask.any():
+        neg_obj = equity.copy()
+        neg_obj[~neg_mask] = origin[~neg_mask]
+
+        fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                       y=np.ones(len(stats['_equity_curve']['Date'])),
+                                       mode='lines', line=dict(color="grey", width=1, dash='dash'), showlegend=False),
+                      row=3, col=1)
+        fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                       y=neg_obj,
+                                       mode='lines', line=dict(color="grey", width=1, dash='dash'), fill="tonexty",
+                                       fillcolor="rgba(140, 0, 0, 0.5)", name='Equity Curve', showlegend=False),
+                      row=3, col=1)
+
+    fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                   y=np.ones(len(stats['_equity_curve']['Date'])),
+                                   mode='lines', line=dict(color="grey", width=1, dash='dash'), showlegend=False),
+                  row=3, col=1)
+
+    fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                   y=equity,
+                                   mode='lines', line=dict(color="darkorchid", width=2), name='Equity Curve'),
+                  row=3, col=1)
+
+    # Plot price
+    norm_df = (df['Close'] - df['Close'][0]) * ((equity.max() - 0.9) / df['Close'].max()) + 1
+
+    fig.add_trace(trace=go.Scatter(x=stats['_equity_curve']['Date'],
+                                   y=norm_df,
+                                   mode='lines', line=dict(color="grey"), showlegend=False),
+                  row=3, col=1)
+    return fig
+
+def plot_result(self):
+    stats = self._results
+    df = self._data
+    fig = make_subplots(rows=3, cols=1,
+                        shared_xaxes=True,
+                        subplot_titles=("Order", "Trade PnL", "Equity Curve"),
+                        vertical_spacing=0.05)
+    fig = plot_candlestick(fig, df, stats)
+    fig = plot_pnl(fig, stats)
+    fig = plot_equity_curve(fig, df, stats)
+
+    layout = {
+        'xaxis': {
+            'rangeslider': {
+                'visible': False
+            }
+        },
+        'yaxis': {
+            'title': 'Price',
+            'tickformat': "digits"
+        },
+        'height': 400 * 3,
+        'width': 800
+    }
+    fig.update_layout(layout)
     return fig

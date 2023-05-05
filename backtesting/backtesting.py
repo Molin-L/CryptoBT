@@ -270,10 +270,10 @@ class Strategy(metaclass=ABCMeta):
         """
         return self._data
 
-    @property
-    def position(self) -> 'Position':
+    def position(self, side=None) -> 'Position':
         """Instance of `backtesting.backtesting.Position`."""
-        return self._broker.position
+
+        return self._broker.get_position(side=side)
 
     @property
     def orders(self) -> 'Tuple[Order, ...]':
@@ -311,65 +311,6 @@ class _Orders(tuple):
                                  'Backtesting 0.2.0. '
                                  'Use `Order` API instead. See docs.')
         raise AttributeError(f"'tuple' object has no attribute {item!r}")
-
-
-class Position:
-    """
-    Currently held asset position, available as
-    `backtesting.backtesting.Strategy.position` within
-    `backtesting.backtesting.Strategy.next`.
-    Can be used in boolean contexts, e.g.
-
-        if self.position:
-            ...  # we have a position, either long or short
-    """
-    def __init__(self, broker: '_Broker'):
-        self.__broker = broker
-
-    def __bool__(self):
-        return self.size != 0
-
-    @property
-    def size(self) -> float:
-        """Position size in units of asset. Negative if position is short."""
-        return sum(trade.size for trade in self.__broker.trades)
-
-    @property
-    def pl(self) -> float:
-        """Profit (positive) or loss (negative) of the current position in cash units."""
-        return sum(trade.pl for trade in self.__broker.trades)
-
-    @property
-    def pl_pct(self) -> float:
-        """Profit (positive) or loss (negative) of the current position in percent."""
-        weights = np.abs([trade.size for trade in self.__broker.trades])
-        weights = weights / weights.sum()
-        pl_pcts = np.array([trade.pl_pct for trade in self.__broker.trades])
-        return (pl_pcts * weights).sum()
-
-    @property
-    def is_long(self) -> bool:
-        """True if the position is long (position size is positive)."""
-        return self.size > 0
-
-    @property
-    def is_short(self) -> bool:
-        """True if the position is short (position size is negative)."""
-        return self.size < 0
-
-    def close(self, portion: float = 1.):
-        """
-        Close portion of position by closing `portion` of each active trade. See `Trade.close`.
-        """
-        for trade in self.__broker.trades:
-            trade.close(portion)
-
-    def __repr__(self):
-        return f'<Position: {self.size} ({len(self.__broker.trades)} trades)>'
-
-
-class _OutOfMoneyError(Exception):
-    pass
 
 
 class Order:
@@ -546,6 +487,91 @@ class Order:
         return bool(self.__parent_trade)
 
 
+class Position:
+    """
+    Currently held asset position, available as
+    `backtesting.backtesting.Strategy.position` within
+    `backtesting.backtesting.Strategy.next`.
+    Can be used in boolean contexts, e.g.
+
+        if self.position:
+            ...  # we have a position, either long or short
+    """
+
+    def __init__(self, broker: '_Broker'):
+        self.__broker = broker
+        self.side = Side.Buy
+        self.price = 0
+        self.p_size = 0
+
+    def __bool__(self):
+        return self.size != 0
+
+    def set_side(self, side: Side):
+        self.side = Side
+        return self
+
+    def place_order(self, order: Order):
+        order_size = order.size
+        if order.reduce_only and order.size > self.size:
+            order_size = self.size
+
+        if self.side == order.side:
+            self.price = self.price * self.size / (self.size + order_size) + order.limit_price * order_size / (
+                    self.size + order_size)
+            self.p_size = self.size + order_size
+        else:
+            self.p_size = self.size - order_size
+
+    @property
+    def size(self) -> float:
+        """Position size in units of asset. Negative if position is short."""
+        return sum(trade.size for trade in self.__broker.trades)
+
+    @property
+    def value(self) -> float:
+        return self.size * self.__broker.last_price
+
+    @property
+    def pl(self) -> float:
+        """Profit (positive) or loss (negative) of the current position in cash units."""
+        if self.__broker._hedging:
+            return sum(trade.pl for trade in self.__broker.trades)
+        return sum(trade.pl for trade in self.__broker.trades)
+
+    @property
+    def pl_pct(self) -> float:
+        """Profit (positive) or loss (negative) of the current position in percent."""
+        weights = np.abs([trade.size for trade in self.__broker.trades])
+        weights = weights / weights.sum()
+        pl_pcts = np.array([trade.pl_pct for trade in self.__broker.trades])
+        return (pl_pcts * weights).sum()
+
+    @property
+    def is_long(self) -> bool:
+        """True if the position is long (position size is positive)."""
+        return self.size > 0
+
+    @property
+    def is_short(self) -> bool:
+        """True if the position is short (position size is negative)."""
+        return self.size < 0
+
+    def close(self, portion: float = 1.):
+        """
+        Close portion of position by closing `portion` of each active trade. See `Trade.close`.
+        """
+        for trade in self.__broker.trades:
+            trade.close(portion)
+
+    def __repr__(self):
+        return f'<Position: {self.size} ({len(self.__broker.trades)} trades)>'
+
+
+class _OutOfMoneyError(Exception):
+    pass
+
+
 class Trade:
     """
     When an `Order` is filled, it results in an active `Trade`.
@@ -565,6 +591,8 @@ class Trade:
         self.__tp_order: Optional[Order] = None
         self.__tag = tag
 
+        self.trade_status = TradeStatus.Open
+
     def __repr__(self):
         return f'<Trade size={self.__size} time={self.__entry_bar}-{self.__exit_bar or ""} ' \
                f'price={self.__entry_price}-{self.__exit_price or ""} pl={self.pl:.0f}' \
@@ -581,7 +609,8 @@ class Trade:
     def close(self, portion: float = 1.):
         """Place new `Order` to close `portion` of the trade at next market price."""
         assert 0 < portion <= 1, "portion must be a fraction between 0 and 1"
-        order = Order(self.__broker, self.size, self.side.opposite(), parent_trade=self, tag=self.__tag, reduce_only=True)
+        order = Order(self.__broker, self.size, self.side.opposite(), parent_trade=self, tag=self.__tag,
+                      reduce_only=True)
         # Todo: immediately fill the order within the candle stick, so that the margin will be released immediately.
         self.__broker.orders.insert(0, order)
 
@@ -749,7 +778,17 @@ class _Broker:
         self._symbol_config: SymbolConfig = symbol_config
         self.orders: List[Order] = []
         self.trades: List[Trade] = []
-        self.position = Position(self)
+
+        self._position = Position(self)
+        self.positions = {
+            Side.Buy: Position(self).set_side(Side.Buy), Side.Sell: Position(self).set_side(Side.Sell)
+        }
+        if hedging:
+            self.stop_orders = {
+                Side.Buy: [], Side.Sell: []
+            }
+        else:
+            self.stop_orders = []
         self.closed_trades: List[Trade] = []
 
     def __repr__(self):
@@ -770,9 +809,11 @@ class _Broker:
         """
         Argument size indicates whether the order is long or short
         """
-        if size is None:
-            size = self.equity / (limit if limit else self.last_price)
-        size = self._adjusted_size(float(size), limit)
+        max_order_size = self.get_max_order_size(side, limit)
+        if size is None or size > max_order_size:
+            size = max_order_size
+        else:
+            size = self._symbol_config.convert_order_size(size)
         stop = stop and float(stop)
         limit = limit and float(limit)
         sl = sl and float(sl)
@@ -794,13 +835,6 @@ class _Broker:
 
         order = Order(self, size, side, adjusted_price, stop, sl, tp, trade, reduce_only, tag)
 
-        # Add cost occupation when placing order.
-        '''
-        if self.available_balance < self.get_order_cost(order):
-            return None
-        self.available_balance -= self.get_order_cost(order)
-        '''
-
         # Put the new order in the order queue,
         # inserting SL/TP/trade-closing orders in-front
         if trade:
@@ -819,6 +853,49 @@ class _Broker:
 
         return order
 
+    def get_max_order_size(self, side: Side, price: float = None):
+        current_price = price if price else self.last_price
+        if self._hedging:
+            if self.positions[side.opposite()].size > 0:
+                return self._symbol_config.convert_order_size((self._cash / current_price) / (1 + self._commission))
+            else:
+                return self._symbol_config.convert_order_size((self._cash / current_price) / (1 + self._commission)) - \
+                    self.positions[side].size
+        else:
+            if self._position.size > 0:
+                if self._position.side != side:
+                    return self._position.size + self._symbol_config.convert_order_size(
+                        (self._cash / current_price) / (1 + self._commission))
+                else:
+                    return self._symbol_config.convert_order_size(
+                        (self._cash / current_price) / (1 + self._commission)) - self._position.size
+            return self._symbol_config.convert_order_size((self._cash / current_price) / (1 + self._commission))
+
+    def get_order_cost(self, order):
+        # Todo: Support leverage
+        if order.reduce_only:
+            return 0
+        return (1 + self._commission) * order.size * order.limit_price
+
+    def get_position(self, side: Side = None):
+        if self._hedging:
+            if side is None:
+                raise ValueError("Hedging mode need position side")
+            else:
+                return self.positions[side]
+        else:
+            return self._position
+
+    @property
+    def position(self, side: Side = None):
+        if self._hedging:
+            if side is None:
+                raise ValueError("Hedging mode need position side")
+            else:
+                return self.positions[side]
+        else:
+            return self._position
+
     @property
     def last_price(self) -> float:
         """ Price at the last (current) close. """
@@ -830,16 +907,6 @@ class _Broker:
         In long positions, the adjusted price is a fraction higher, and vice versa.
         """
         return (price or self.last_price) * (1 + copysign(self._commission, size))
-
-    def _adjusted_size(self, size=None, price=None) -> float:
-        """
-        Order.size, adjusted for commisions.
-        The size must be a multiple of the ticksize (default: 0.00001)
-        """
-        # size * price * commission + size * price = equity
-        # (1 + commision) * size * price = equity
-        current_price = price if price else self.last_price
-        return self._symbol_config.convert_order_size((self.equity / current_price) / (1 + self._commission))
 
     @property
     def equity(self) -> float:
@@ -869,6 +936,83 @@ class _Broker:
             raise _OutOfMoneyError
 
     def _process_orders(self):
+        data = self._data
+        open, high, low = data.Open[-1], data.High[-1], data.Low[-1]
+        prev_close = data.Close[-2]
+
+        for order in list(self.orders):  # type: Order
+            # Check if stop condition was hit
+            stop_price = order.stop
+            if stop_price:
+                is_stop_hit = ((high > stop_price) if order.is_long else (low < stop_price))
+                if not is_stop_hit:
+                    continue
+
+                # > When the stop price is reached, a stop order becomes a market/limit order.
+                # https://www.sec.gov/fast-answers/answersstopordhtm.html
+                order._replace(stop_price=None)
+
+            if order.limit:
+                is_limit_hit = low < order.limit if order.is_long else high > order.limit
+                # When stop and limit are hit within the same bar, we pessimistically
+                # assume limit was hit before the stop (i.e. "before it counts")
+                is_limit_hit_before_stop = (is_limit_hit and
+                                            (order.limit < (stop_price or -np.inf)
+                                             if order.is_long
+                                             else order.limit > (stop_price or np.inf)))
+                if not is_limit_hit or is_limit_hit_before_stop:
+                    continue
+
+                # stop_price, if set, was hit within this bar
+                price = (min(stop_price or open, order.limit)
+                         if order.is_long else
+                         max(stop_price or open, order.limit))
+            else:
+                # Market-if-touched / market order
+                price = prev_close if self._trade_on_close else open
+                price = (max(price, stop_price or -np.inf)
+                         if order.is_long else
+                         min(price, stop_price or np.inf))
+
+            # Determine entry/exit bar index
+            is_market_order = not order.limit and not stop_price
+            time_index = (self._i - 1) if is_market_order and self._trade_on_close else self._i
+
+            if order.parent_trade:
+                trade = order.parent_trade
+                _prev_size = trade.size
+                # If order.size is "greater" than trade.size, this order is a trade.close()
+                # order and part of the trade was already closed beforehand
+                size = copysign(min(abs(_prev_size), abs(order.size)), order.size)
+                # If this trade isn't already closed (e.g. on multiple `trade.close(.5)` calls)
+                if trade in self.trades:
+                    self._reduce_trade(trade, price, size, time_index)
+                    assert order.size != -_prev_size or trade not in self.trades
+                if order in (trade._sl_order,
+                             trade._tp_order):
+                    assert order.size == -trade.size
+                    assert order not in self.orders  # Removed when trade was closed
+                else:
+                    # It's a trade.close() order, now done
+                    assert abs(_prev_size) >= abs(size)
+                    self.orders.remove(order)
+                continue
+
+            if not self._hedging and self.position.side == order.side.opposite() and self.position.size != 0:
+                self._reduce_position_with_order(order, time_index)
+                if order in self.orders:
+                    self._open_trade_with_order(order, time_index)
+                continue
+
+            if order.reduce_only:
+                self._reduce_position_with_order(order, time_index)
+            else:
+                self._open_trade_with_order(order, time_index)
+
+            # Order processed
+            self.orders.remove(order)
+
+    def _process_orders_old(self):
         data = self._data
         open, high, low = data.Open[-1], data.High[-1], data.Low[-1]
         prev_close = data.Close[-2]
@@ -1044,7 +1188,48 @@ class _Broker:
         self.closed_trades.append(trade._replace(exit_price=price, exit_bar=time_index))
         self._cash += trade.pl
 
-    def _open_trade(self, price: float, size: int,
+    def _reduce_position_with_order(self, order: Order, time_index: int):
+        remain_order_size = order.size
+        for trade in self.trades:
+            if trade.side == order.side:
+                continue
+            if trade.size > remain_order_size:
+                trade._replace(size=trade.size - remain_order_size)
+                if trade._sl_order:
+                    trade._sl_order._replace(size=trade.size)
+                if trade._tp_order:
+                    trade._tp_order._replace(size=trade.size)
+                close_trade = trade._copy(size=remain_order_size, sl_order=None, tp_order=None)
+                close_trade.trade_status = TradeStatus.Closed
+                self.closed_trades.append(close_trade)
+                break
+            else:
+                remain_order_size -= trade.size
+                self._close_trade(trade, order.limit_price, time_index)
+        if remain_order_size != 0:
+            order._replace(size=remain_order_size)
+        else:
+            self.orders.remove(order)
+
+    def _open_trade_with_order(self, order: Order, time_index: int):
+        trade = Trade(self, order.size, order.side, order.limit_price, time_index, order.tag)
+        if self._hedging:
+            if order.reduce_only:
+                self.positions[order.side.opposite()].place_order(order)
+            else:
+                self.positions[order.side].place_order(order)
+        else:
+            self.position.place_order(order)
+
+        if order.tp:
+            trade.tp = order.tp
+        if order.sl:
+            trade.sl = order.sl
+        trade.trade_status = TradeStatus.Open
+
+        self.trades.append(trade)
+
+    def _open_trade(self, price: float, size: int, side: Side,
                     sl: Optional[float], tp: Optional[float], time_index: int, tag):
         trade = Trade(self, size, side, price, time_index, tag)
         # Create SL/TP (bracket) orders.
